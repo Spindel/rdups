@@ -55,14 +55,14 @@ fn main() -> Result<(), io::Error> {
 
 // walk_files, walk all files in all subdirectories.
 // Return a vector with size and file path.
-fn walk_files(path: &str) -> Result<Vec<(u64, PathBuf)>, io::Error> {
-    let mut files: Vec<(u64, PathBuf)> = Vec::new();
+fn walk_files(path: &str) -> Result<Vec<(u64, Option<PathBuf>)>, io::Error> {
+    let mut files: Vec<(u64, Option<PathBuf>)> = Vec::new();
 
     for entry in WalkDir::new(path).into_iter().filter_map(|e| e.ok()) {
         if entry.file_type().is_file() {
             let file_len = entry.metadata()?.len();
             if file_len != 0 {
-                files.push((file_len, entry.into_path()));
+                files.push((file_len, Some(entry.into_path())));
             }
         }
     }
@@ -71,8 +71,8 @@ fn walk_files(path: &str) -> Result<Vec<(u64, PathBuf)>, io::Error> {
 
 // group_files_by_size group all files by file size. Using a
 // vector with size and path.
-fn group_files_by_size(files: Vec<(u64, PathBuf)>) -> BTreeMap<u64, Vec<PathBuf>> {
-    let mut groups: BTreeMap<u64, Vec<PathBuf>> = BTreeMap::new();
+fn group_files_by_size(files: Vec<(u64, Option<PathBuf>)>) -> BTreeMap<u64, Vec<Option<PathBuf>>> {
+    let mut groups: BTreeMap<u64, Vec<Option<PathBuf>>> = BTreeMap::new();
 
     for (size, path) in files {
         groups.entry(size).or_default().push(path);
@@ -80,21 +80,26 @@ fn group_files_by_size(files: Vec<(u64, PathBuf)>) -> BTreeMap<u64, Vec<PathBuf>
     groups
 }
 
-// group_files_by_checksum group all files by checksum. Using blake3 to calculate a
-// checksum for the files.
-fn group_files_by_checksum(
-    files: BTreeMap<u64, Vec<PathBuf>>,
-) -> Result<HashMap<String, Vec<PathBuf>>, io::Error> {
-    let mut groups: HashMap<String, Vec<PathBuf>> = HashMap::new();
-    use rayon::prelude::*;
-
+fn filter_file_list(files: BTreeMap<u64, Vec<Option<PathBuf>>>) -> Vec<PathBuf> {
     // Filter the files to check into a list of paths only, flattening the hashmap.
     let files_to_check: Vec<_> = files
         .into_iter()
         .filter(|(_, paths)| paths.len() > 1)
-        .map(|(_, paths)| paths.into_iter())
+        .map(|(_, paths)| paths.into_iter().flatten())
         .flatten()
         .collect();
+    files_to_check
+}
+
+// group_files_by_checksum group all files by checksum. Using blake3 to calculate a
+// checksum for the files.
+fn group_files_by_checksum(
+    files: BTreeMap<u64, Vec<Option<PathBuf>>>,
+) -> Result<HashMap<String, Vec<PathBuf>>, io::Error> {
+    let mut groups: HashMap<String, Vec<PathBuf>> = HashMap::new();
+    use rayon::prelude::*;
+
+    let files_to_check = filter_file_list(files);
 
     // Hash all files as (Result<sum>, path)
     let mut hashes: Vec<_> = files_to_check
