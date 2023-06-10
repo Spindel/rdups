@@ -1,5 +1,5 @@
 // Std
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::fs::File;
 use std::io;
@@ -71,8 +71,8 @@ fn walk_files(path: &str) -> Result<Vec<(u64, PathBuf)>, io::Error> {
 
 // group_files_by_size group all files by file size. Using a
 // vector with size and path.
-fn group_files_by_size(files: Vec<(u64, PathBuf)>) -> HashMap<u64, Vec<PathBuf>> {
-    let mut groups: HashMap<u64, Vec<PathBuf>> = HashMap::new();
+fn group_files_by_size(files: Vec<(u64, PathBuf)>) -> BTreeMap<u64, Vec<PathBuf>> {
+    let mut groups: BTreeMap<u64, Vec<PathBuf>> = BTreeMap::new();
 
     for (size, path) in files {
         groups.entry(size).or_default().push(path);
@@ -83,7 +83,7 @@ fn group_files_by_size(files: Vec<(u64, PathBuf)>) -> HashMap<u64, Vec<PathBuf>>
 // group_files_by_checksum group all files by checksum. Using blake3 to calculate a
 // checksum for the files.
 fn group_files_by_checksum(
-    files: HashMap<u64, Vec<PathBuf>>,
+    files: BTreeMap<u64, Vec<PathBuf>>,
 ) -> Result<HashMap<String, Vec<PathBuf>>, io::Error> {
     let mut groups: HashMap<String, Vec<PathBuf>> = HashMap::new();
 
