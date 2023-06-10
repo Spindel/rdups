@@ -86,6 +86,7 @@ fn group_files_by_checksum(
     files: BTreeMap<u64, Vec<PathBuf>>,
 ) -> Result<HashMap<String, Vec<PathBuf>>, io::Error> {
     let mut groups: HashMap<String, Vec<PathBuf>> = HashMap::new();
+    use rayon::prelude::*;
 
     // Filter the files to check into a list of paths only, flattening the hashmap.
     let files_to_check: Vec<_> = files
@@ -97,7 +98,7 @@ fn group_files_by_checksum(
 
     // Hash all files as (Result<sum>, path)
     let mut hashes: Vec<_> = files_to_check
-        .into_iter()
+        .into_par_iter()
         .map(|path| (blake3_checksum(&path), path))
         .collect();
 

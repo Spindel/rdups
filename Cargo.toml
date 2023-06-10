@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 blake3 = "1.4.0"
+rayon = "1.7.0"
 walkdir = "2.3.3"
 
 [profile.release]
