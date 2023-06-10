@@ -1,0 +1,14 @@
+[package]
+name = "rdups"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+blake3 = "1.4.0"
+walkdir = "2.3.3"
+
+[profile.release]
+debug = false
+lto = true
+opt-level = "z"
+strip = true
