@@ -1,4 +1,5 @@
 // Std
+use std::sync::{Arc, Mutex};
 use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::fs::File;
@@ -17,12 +18,9 @@ use blake3::Hasher;
 fn main() -> Result<(), io::Error> {
     // Parse arguments.
     let args: Vec<String> = env::args().collect();
-    let path = match args.get(1) {
-        Some(path) => path,
-        None => {
-            println!("Usage rdups DIRECTORY");
-            return Ok(());
-        }
+    let Some(path) = args.get(1) else {
+        println!("Usage rdups DIRECTORY");
+        return Ok(());
     };
 
     let (paths_tx, paths_rx) = mpsc::channel();
@@ -32,11 +30,11 @@ fn main() -> Result<(), io::Error> {
     let path: String = path.into();
 
     // Walk all files.
-    thread::spawn(move || walk_files(path, paths_tx).expect("Failure is an option"));
+    thread::spawn(move || walk_files(path, &paths_tx).expect("Failure is an option"));
 
     // Split out the filtering file actor, it buffers data from the file walker and then sends
     // paths that should be hashed out as they arrive.
-    thread::spawn(move || filter_files(paths_rx, hash_tx));
+    thread::spawn(move || filter_files(&paths_rx, &hash_tx));
 
     // Group all files by checksum.
     let group_by_checksum = group_files_by_checksum(hash_rx)?;
@@ -47,7 +45,7 @@ fn main() -> Result<(), io::Error> {
     // Print all duplicated files to terminal.
     for (_, files) in dups {
         for path in files {
-            println!("{:?}", path);
+            println!("{path:?}");
         }
         println!("");
     }
@@ -56,7 +54,7 @@ fn main() -> Result<(), io::Error> {
 }
 
 /// Filter files as they come in, based on their metadata.
-fn filter_files(rx: mpsc::Receiver<(u64, PathBuf)>, tx: mpsc::Sender<PathBuf>) {
+fn filter_files(rx: &mpsc::Receiver<(u64, PathBuf)>, tx: &mpsc::Sender<PathBuf>) {
     let mut groups: BTreeMap<u64, Vec<Option<PathBuf>>> = BTreeMap::new();
     while let Ok((file_len, path)) = rx.recv() {
         {
@@ -76,7 +74,7 @@ fn filter_files(rx: mpsc::Receiver<(u64, PathBuf)>, tx: mpsc::Sender<PathBuf>) {
                 // same as above
                 files
                     .iter_mut()
-                    .filter_map(|x| x.take())
+                    .filter_map(Option::take)
                     .for_each(|path| tx.send(path).unwrap());
             }
         }
@@ -85,8 +83,8 @@ fn filter_files(rx: mpsc::Receiver<(u64, PathBuf)>, tx: mpsc::Sender<PathBuf>) {
 
 // walk_files, walk all files in all subdirectories.
 // Return a vector with size and file path.
-fn walk_files(path: String, tx: mpsc::Sender<(u64, PathBuf)>) -> Result<(), io::Error> {
-    for entry in WalkDir::new(path).into_iter().filter_map(|e| e.ok()) {
+fn walk_files(path: String, tx: &mpsc::Sender<(u64, PathBuf)>) -> Result<(), io::Error> {
+    for entry in WalkDir::new(path).into_iter().filter_map(Result::ok) {
         if entry.file_type().is_file() {
             let file_len = entry.metadata()?.len();
             if file_len != 0 {
@@ -98,54 +96,65 @@ fn walk_files(path: String, tx: mpsc::Sender<(u64, PathBuf)>) -> Result<(), io::
     Ok(())
 }
 
+
+fn wait_for_file(tx: &mpsc::Sender<(String, PathBuf)>, lx: &Arc<Mutex<mpsc::Receiver<PathBuf>>> ) -> Result<(), io::Error>
+{
+    loop {       
+        let path = {
+            if let Ok(rx) = lx.lock() {
+                rx.recv()
+            } else {
+                // Failed to lock / Poisoned.
+                // Another thread died while holding the rx lock
+                return Ok(());
+            }
+        };
+
+        if let Ok(path) = path {
+            let sum = blake3_checksum(&path)?;
+            if tx.send((sum, path)).is_err() {
+                // Unable to send data to receiever?
+                // Main thread may be dead for some reason
+                return Ok(());
+            }
+        }
+        // Channel hung up, no more data
+        else {
+            return Ok(());
+        }
+    }
+}
+
 // group_files_by_checksum group all files by checksum. Using blake3 to calculate a
 // checksum for the files.
 fn group_files_by_checksum(
     filechan: mpsc::Receiver<PathBuf>,
 ) -> Result<HashMap<String, Vec<PathBuf>>, io::Error> {
-    use std::sync::{Arc, Mutex};
-
     // Channels for the worker-threads that hash the files
     let (tx, rx) = mpsc::channel();
 
     // Wrap the readable channel in an mutex with reference counting,
     // so the threads can read them as wanted
     let lx = Arc::new(Mutex::new(filechan));
-    for _ in 0..64 {
+    let mut threads = Vec::with_capacity(32);
+    for _ in 0..32 {
         let rx = lx.clone();
         let tx = tx.clone();
-        thread::spawn(move || {
-            loop {
-                let path = {
-                    if let Ok(rx) = rx.lock() {
-                        rx.recv()
-                    } else {
-                        // Failed to lock / Poisoned.
-                        // Another thread died while holding the rx lock
-                        return;
-                    }
-                };
-                if let Ok(path) = path {
-                    let sum = blake3_checksum(&path);
-                    if tx.send((sum, path)).is_err() {
-                        // Unable to send data to receiever?
-                        // Main thread may be dead for some reason
-                        return;
-                    }
-                }
-                // Channel hung up, no more data
-                else {
-                    return;
-                }
-            }
+        let t = thread::spawn(move || {
+            wait_for_file(&tx, &rx)
         });
+        threads.push(t);
     }
     // Drop the original tx, or we will always have a living sender
     drop(tx);
 
+    // Consume all hashes from the channel into a HashMap
     let mut groups: HashMap<String, Vec<PathBuf>> = HashMap::new();
     while let Ok((sum, path)) = rx.recv() {
-        groups.entry(sum?).or_default().push(path);
+        groups.entry(sum).or_default().push(path);
+    }
+    for t in threads {
+        t.join().expect("Thread wait error")?;
     }
     Ok(groups)
 }
