@@ -1,11 +1,11 @@
 // Std
-use std::sync::{Arc, Mutex};
 use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::fs::File;
 use std::io;
 use std::path::PathBuf;
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::vec::Vec;
 
@@ -24,7 +24,6 @@ fn main() -> Result<(), io::Error> {
     };
 
     let (paths_tx, paths_rx) = mpsc::channel();
-    let (hash_tx, hash_rx) = mpsc::channel();
 
     // Make path an owned copy for the walker thread
     let path: String = path.into();
@@ -32,12 +31,8 @@ fn main() -> Result<(), io::Error> {
     // Walk all files.
     thread::spawn(move || walk_files(path, &paths_tx).expect("Failure is an option"));
 
-    // Split out the filtering file actor, it buffers data from the file walker and then sends
-    // paths that should be hashed out as they arrive.
-    thread::spawn(move || filter_files(&paths_rx, &hash_tx));
-
     // Group all files by checksum.
-    let group_by_checksum = group_files_by_checksum(hash_rx)?;
+    let group_by_checksum = group_files_by_checksum(paths_rx)?;
 
     // Get all duplicated files, grouped by checksum.
     let dups = duplicated_files(group_by_checksum);
@@ -53,53 +48,38 @@ fn main() -> Result<(), io::Error> {
     Ok(())
 }
 
-/// Filter files as they come in, based on their metadata.
-fn filter_files(rx: &mpsc::Receiver<(u64, PathBuf)>, tx: &mpsc::Sender<PathBuf>) {
-    let mut groups: BTreeMap<u64, Vec<Option<PathBuf>>> = BTreeMap::new();
-    while let Ok((file_len, path)) = rx.recv() {
-        {
-            let files = groups.entry(file_len).or_default();
-            if files.is_empty() {
-                files.push(Some(path));
-            } else {
-                tx.send(path).unwrap();
-                files.push(None);
-                /*
-                for f in files {
-                    if let Some(f) = f.take() {
-                        tx.send(f).unwrap();
-                    }
-                }*/
-                // I'm still learning how the iterable approach is supposed to look, this is the
-                // same as above
-                files
-                    .iter_mut()
-                    .filter_map(Option::take)
-                    .for_each(|path| tx.send(path).unwrap());
-            }
-        }
-    }
-}
-
 // walk_files, walk all files in all subdirectories.
-// Return a vector with size and file path.
-fn walk_files(path: String, tx: &mpsc::Sender<(u64, PathBuf)>) -> Result<(), io::Error> {
+// Pushes paths to be inspected into the TX channel
+fn walk_files(path: String, tx: &mpsc::Sender<PathBuf>) -> Result<(), io::Error> {
+    let mut groups: BTreeMap<u64, Vec<Option<PathBuf>>> = BTreeMap::new();
+
     for entry in WalkDir::new(path).into_iter().filter_map(Result::ok) {
         if entry.file_type().is_file() {
             let file_len = entry.metadata()?.len();
             if file_len != 0 {
-                tx.send((file_len, entry.into_path()))
-                    .expect("tx send failure");
+                let files = groups.entry(file_len).or_default();
+                let path = entry.into_path();
+                if files.is_empty() {
+                    files.push(Some(path));
+                } else {
+                    tx.send(path).unwrap();
+                    files.push(None);
+                    files
+                        .iter_mut()
+                        .filter_map(Option::take)
+                        .for_each(|path| tx.send(path).unwrap());
+                }
             }
         }
     }
     Ok(())
 }
 
-
-fn wait_for_file(tx: &mpsc::Sender<(String, PathBuf)>, lx: &Arc<Mutex<mpsc::Receiver<PathBuf>>> ) -> Result<(), io::Error>
-{
-    loop {       
+fn group_files_worker(
+    tx: &mpsc::Sender<(String, PathBuf)>,
+    lx: &Arc<Mutex<mpsc::Receiver<PathBuf>>>,
+) -> Result<(), io::Error> {
+    loop {
         let path = {
             if let Ok(rx) = lx.lock() {
                 rx.recv()
@@ -140,9 +120,7 @@ fn group_files_by_checksum(
     for _ in 0..32 {
         let rx = lx.clone();
         let tx = tx.clone();
-        let t = thread::spawn(move || {
-            wait_for_file(&tx, &rx)
-        });
+        let t = thread::spawn(move || group_files_worker(&tx, &rx));
         threads.push(t);
     }
     // Drop the original tx, or we will always have a living sender
