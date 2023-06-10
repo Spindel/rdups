@@ -60,11 +60,9 @@ fn walk_files(path: &str) -> Result<Vec<(u64, PathBuf)>, io::Error> {
 
     for entry in WalkDir::new(path).into_iter().filter_map(|e| e.ok()) {
         if entry.file_type().is_file() {
-            let file = File::open(entry.path())?;
-            let file_metadata = file.metadata()?;
-
-            if file_metadata.len() != 0 {
-                files.push((file_metadata.len(), entry.path().to_path_buf()));
+            let file_len = entry.metadata()?.len();
+            if file_len != 0 {
+                files.push((file_len, entry.into_path()));
             }
         }
     }
