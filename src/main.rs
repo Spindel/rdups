@@ -122,5 +122,6 @@ fn blake3_checksum(path: &PathBuf) -> Result<String, io::Error> {
     let mut hasher = Hasher::new();
     let _ = io::copy(&mut f, &mut hasher);
 
-    Ok(format!("{}", hasher.finalize().to_string()))
+    let hash = hasher.finalize().to_string();
+    Ok(hash)
 }
