@@ -4,8 +4,11 @@ use std::env;
 use std::fs::File;
 use std::io;
 use std::path::PathBuf;
-use std::vec::Vec;
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::Instant;
+use std::vec::Vec;
 
 // Walkdir
 use walkdir::WalkDir;
@@ -16,12 +19,9 @@ use blake3::Hasher;
 fn main() -> Result<(), io::Error> {
     // Parse arguments.
     let args: Vec<String> = env::args().collect();
-    let path = match args.get(1) {
-        Some(path) => path,
-        None => {
-            println!("Usage rdups DIRECTORY");
-            return Ok(());
-        }
+    let Some(path) = args.get(1) else {
+        println!("Usage rdups DIRECTORY");
+        return Ok(());
     };
 
     // Walk all files.
@@ -37,7 +37,7 @@ fn main() -> Result<(), io::Error> {
     // Group all files by checksum.
     let start = Instant::now();
     let group_by_checksum = group_files_by_checksum(group_by_size)?;
-    println!("group by checksum: {:?}", start.elapsed());
+    println!("Group by checksum: {:?}", start.elapsed());
 
     // Get all duplicated files, grouped by checksum.
     let dups = duplicated_files(group_by_checksum);
@@ -45,7 +45,7 @@ fn main() -> Result<(), io::Error> {
     // Print all duplicated files to terminal.
     for (_, files) in dups {
         for path in files {
-            println!("{:?}", path);
+            println!("{path:?}");
         }
         println!("");
     }
@@ -91,23 +91,69 @@ fn filter_file_list(files: BTreeMap<u64, Vec<Option<PathBuf>>>) -> Vec<PathBuf> 
     files_to_check
 }
 
+fn group_files_worker(
+    tx: &mpsc::Sender<(String, PathBuf)>,
+    lx: &Arc<Mutex<mpsc::Receiver<PathBuf>>>,
+) -> Result<(), io::Error> {
+    loop {
+        let Ok(rx) = lx.lock() else {
+            // eprintln!("Lock poisoned?");
+            return Ok(());
+        };
+        let Ok(path) = rx.recv() else {
+            // eprintln!("Sender hung up?");
+            return Ok(());
+        };
+        // Drop the lock guard on rx so other threads can read the channel
+        drop(rx);
+        // eprintln!("Processing {path:?}");
+        let sum = blake3_checksum(&path)?;
+        if let Err(_) = tx.send((sum, path)) {
+            // Unable to send data to receiever?
+            // Main thread may be dead for some reason
+            // eprintln!("Send failed?");
+            return Ok(());
+        };
+        // eprintln!("Done one loop");
+    }
+}
+
 // group_files_by_checksum group all files by checksum. Using blake3 to calculate a
 // checksum for the files.
 fn group_files_by_checksum(
     files: BTreeMap<u64, Vec<Option<PathBuf>>>,
 ) -> Result<HashMap<String, Vec<PathBuf>>, io::Error> {
-    let mut groups: HashMap<String, Vec<PathBuf>> = HashMap::new();
+    // Channels for the worker-threads that hash the files
+    let (in_tx, in_rx) = mpsc::channel();
+    let (out_tx, out_rx) = mpsc::channel();
+
+    // Wrap the readable channel in an mutex with reference counting,
+    // so the threads can read them as wanted
+    let lx = Arc::new(Mutex::new(in_rx));
+    let mut threads = Vec::with_capacity(32);
+    for _ in 0..32 {
+        let tx = out_tx.clone();
+        let rx = lx.clone();
+        let t = thread::spawn(move || group_files_worker(&tx, &rx));
+        threads.push(t);
+    }
+    // Drop our tx of result to prevent it from holding our wait-loop alive.
+    drop(out_tx);
 
     let files_to_check = filter_file_list(files);
+    for f in files_to_check {
+        in_tx.send(f).expect("All worker threads are gone");
+    }
+    // Drop our side of the channel to signal the workers that we are done
+    drop(in_tx);
 
-    // Hash all files as (Result<sum>, path)
-    let mut hashes: Vec<_> = files_to_check
-        .into_iter()
-        .map(|path| (blake3_checksum(&path), path))
-        .collect();
-
-    for (sum, path) in hashes.drain(..) {
-        groups.entry(sum?).or_default().push(path);
+    let mut groups: HashMap<String, Vec<PathBuf>> = HashMap::new();
+    // Consume all hashes from the channel into a HashMap
+    while let Ok((sum, path)) = out_rx.recv() {
+        groups.entry(sum).or_default().push(path);
+    }
+    for t in threads {
+        t.join().expect("Thread wait error")?;
     }
     Ok(groups)
 }
