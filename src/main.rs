@@ -5,6 +5,7 @@ use std::fs::File;
 use std::io;
 use std::path::PathBuf;
 use std::vec::Vec;
+use std::time::Instant;
 
 // Walkdir
 use walkdir::WalkDir;
@@ -24,13 +25,19 @@ fn main() -> Result<(), io::Error> {
     };
 
     // Walk all files.
+    let start = Instant::now();
     let files = walk_files(path)?;
+    println!("walk files: {:?}", start.elapsed());
 
     // Group all files by size.
+    let start = Instant::now();
     let group_by_size = group_files_by_size(files);
+    println!("group by size: {:?}", start.elapsed());
 
     // Group all files by checksum.
+    let start = Instant::now();
     let group_by_checksum = group_files_by_checksum(group_by_size)?;
+    println!("group by checksum: {:?}", start.elapsed());
 
     // Get all duplicated files, grouped by checksum.
     let dups = duplicated_files(group_by_checksum);
