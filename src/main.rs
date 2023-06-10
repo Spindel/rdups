@@ -87,13 +87,22 @@ fn group_files_by_checksum(
 ) -> Result<HashMap<String, Vec<PathBuf>>, io::Error> {
     let mut groups: HashMap<String, Vec<PathBuf>> = HashMap::new();
 
-    for (_, files) in files {
-        if files.len() > 1 {
-            for path in files {
-                let sum = blake3_checksum(&path)?;
-                groups.entry(sum).or_default().push(path);
-            }
-        }
+    // Filter the files to check into a list of paths only, flattening the hashmap.
+    let files_to_check: Vec<_> = files
+        .into_iter()
+        .filter(|(_, paths)| paths.len() > 1)
+        .map(|(_, paths)| paths.into_iter())
+        .flatten()
+        .collect();
+
+    // Hash all files as (Result<sum>, path)
+    let mut hashes: Vec<_> = files_to_check
+        .into_iter()
+        .map(|path| (blake3_checksum(&path), path))
+        .collect();
+
+    for (sum, path) in hashes.drain(..) {
+        groups.entry(sum?).or_default().push(path);
     }
     Ok(groups)
 }
