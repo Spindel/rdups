@@ -130,7 +130,7 @@ fn group_files_by_checksum(
     // Wrap the readable channel in an mutex with reference counting,
     // so the threads can read them as wanted
     let lx = Arc::new(Mutex::new(in_rx));
-    let mut threads = Vec::with_capacity(32);
+    let mut threads = Vec::with_capacity(34);
     for _ in 0..32 {
         let tx = out_tx.clone();
         let rx = lx.clone();
@@ -140,12 +140,15 @@ fn group_files_by_checksum(
     // Drop our tx of result to prevent it from holding our wait-loop alive.
     drop(out_tx);
 
-    let files_to_check = filter_file_list(files);
-    for f in files_to_check {
-        in_tx.send(f).expect("All worker threads are gone");
-    }
-    // Drop our side of the channel to signal the workers that we are done
-    drop(in_tx);
+    // Create a worker thread that posts paths to the workers.
+    let filler = thread::spawn(move || {
+        let files_to_check = filter_file_list(files);
+        for f in files_to_check {
+            in_tx.send(f).expect("All worker threads are gone");
+        }
+        Ok(())
+    });
+    threads.push(filler);
 
     let mut groups: HashMap<String, Vec<PathBuf>> = HashMap::new();
     // Consume all hashes from the channel into a HashMap
