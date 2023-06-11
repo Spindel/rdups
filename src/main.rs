@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Instant;
 use std::vec::Vec;
 
 // Walkdir
@@ -29,10 +30,16 @@ fn main() -> Result<(), io::Error> {
     let path: String = path.into();
 
     // Walk all files.
-    thread::spawn(move || walk_files(path, &paths_tx).expect("Failure is an option"));
+    thread::spawn(move || {
+                let start = Instant::now();
+                walk_files(path, &paths_tx).expect("Failure is an option");
+                println!("walk files: {:?}", start.elapsed());
+            });
 
     // Group all files by checksum.
+    let start = Instant::now();
     let group_by_checksum = group_files_by_checksum(paths_rx)?;
+    println!("Group by checksum: {:?}", start.elapsed());
 
     // Get all duplicated files, grouped by checksum.
     let dups = duplicated_files(group_by_checksum);
