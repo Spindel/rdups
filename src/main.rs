@@ -24,21 +24,19 @@ fn main() -> Result<(), io::Error> {
         return Ok(());
     };
 
-    let (paths_tx, paths_rx) = mpsc::channel();
-
-    // Make path an owned copy for the walker thread
-    let path: String = path.into();
-
     // Walk all files.
-    thread::spawn(move || {
-                let start = Instant::now();
-                walk_files(path, &paths_tx).expect("Failure is an option");
-                println!("walk files: {:?}", start.elapsed());
-            });
+    let start = Instant::now();
+    let files = walk_files(path)?;
+    println!("walk files: {:?}", start.elapsed());
+
+    // Group all files by size.
+    let start = Instant::now();
+    let group_by_size = group_files_by_size(files);
+    println!("group by size: {:?}", start.elapsed());
 
     // Group all files by checksum.
     let start = Instant::now();
-    let group_by_checksum = group_files_by_checksum(paths_rx)?;
+    let group_by_checksum = group_files_by_checksum(group_by_size)?;
     println!("Group by checksum: {:?}", start.elapsed());
 
     // Get all duplicated files, grouped by checksum.
@@ -56,30 +54,41 @@ fn main() -> Result<(), io::Error> {
 }
 
 // walk_files, walk all files in all subdirectories.
-// Pushes paths to be inspected into the TX channel
-fn walk_files(path: String, tx: &mpsc::Sender<PathBuf>) -> Result<(), io::Error> {
-    let mut groups: BTreeMap<u64, Vec<Option<PathBuf>>> = BTreeMap::new();
+// Return a vector with size and file path.
+fn walk_files(path: &str) -> Result<Vec<(u64, Option<PathBuf>)>, io::Error> {
+    let mut files: Vec<(u64, Option<PathBuf>)> = Vec::new();
 
-    for entry in WalkDir::new(path).into_iter().filter_map(Result::ok) {
+    for entry in WalkDir::new(path).into_iter().filter_map(|e| e.ok()) {
         if entry.file_type().is_file() {
             let file_len = entry.metadata()?.len();
             if file_len != 0 {
-                let files = groups.entry(file_len).or_default();
-                let path = entry.into_path();
-                if files.is_empty() {
-                    files.push(Some(path));
-                } else {
-                    tx.send(path).unwrap();
-                    files.push(None);
-                    files
-                        .iter_mut()
-                        .filter_map(Option::take)
-                        .for_each(|path| tx.send(path).unwrap());
-                }
+                files.push((file_len, Some(entry.into_path())));
             }
         }
     }
-    Ok(())
+    Ok(files)
+}
+
+// group_files_by_size group all files by file size. Using a
+// vector with size and path.
+fn group_files_by_size(files: Vec<(u64, Option<PathBuf>)>) -> BTreeMap<u64, Vec<Option<PathBuf>>> {
+    let mut groups: BTreeMap<u64, Vec<Option<PathBuf>>> = BTreeMap::new();
+
+    for (size, path) in files {
+        groups.entry(size).or_default().push(path);
+    }
+    groups
+}
+
+fn filter_file_list(files: BTreeMap<u64, Vec<Option<PathBuf>>>) -> Vec<PathBuf> {
+    // Filter the files to check into a list of paths only, flattening the hashmap.
+    let files_to_check: Vec<_> = files
+        .into_iter()
+        .filter(|(_, paths)| paths.len() > 1)
+        .map(|(_, paths)| paths.into_iter().flatten())
+        .flatten()
+        .collect();
+    files_to_check
 }
 
 fn group_files_worker(
@@ -87,55 +96,60 @@ fn group_files_worker(
     lx: &Arc<Mutex<mpsc::Receiver<PathBuf>>>,
 ) -> Result<(), io::Error> {
     loop {
-        let path = {
-            if let Ok(rx) = lx.lock() {
-                rx.recv()
-            } else {
-                // Failed to lock / Poisoned.
-                // Another thread died while holding the rx lock
-                return Ok(());
-            }
-        };
-
-        if let Ok(path) = path {
-            let sum = blake3_checksum(&path)?;
-            if tx.send((sum, path)).is_err() {
-                // Unable to send data to receiever?
-                // Main thread may be dead for some reason
-                return Ok(());
-            }
-        }
-        // Channel hung up, no more data
-        else {
+        let Ok(rx) = lx.lock() else {
+            // eprintln!("Lock poisoned?");
             return Ok(());
-        }
+        };
+        let Ok(path) = rx.recv() else {
+            // eprintln!("Sender hung up?");
+            return Ok(());
+        };
+        // Drop the lock guard on rx so other threads can read the channel
+        drop(rx);
+        // eprintln!("Processing {path:?}");
+        let sum = blake3_checksum(&path)?;
+        if let Err(_) = tx.send((sum, path)) {
+            // Unable to send data to receiever?
+            // Main thread may be dead for some reason
+            // eprintln!("Send failed?");
+            return Ok(());
+        };
+        // eprintln!("Done one loop");
     }
 }
 
 // group_files_by_checksum group all files by checksum. Using blake3 to calculate a
 // checksum for the files.
 fn group_files_by_checksum(
-    filechan: mpsc::Receiver<PathBuf>,
+    files: BTreeMap<u64, Vec<Option<PathBuf>>>,
 ) -> Result<HashMap<String, Vec<PathBuf>>, io::Error> {
     // Channels for the worker-threads that hash the files
-    let (tx, rx) = mpsc::channel();
+    let (in_tx, in_rx) = mpsc::channel();
+    let (out_tx, out_rx) = mpsc::channel();
 
     // Wrap the readable channel in an mutex with reference counting,
     // so the threads can read them as wanted
-    let lx = Arc::new(Mutex::new(filechan));
+    let lx = Arc::new(Mutex::new(in_rx));
     let mut threads = Vec::with_capacity(32);
     for _ in 0..32 {
+        let tx = out_tx.clone();
         let rx = lx.clone();
-        let tx = tx.clone();
         let t = thread::spawn(move || group_files_worker(&tx, &rx));
         threads.push(t);
     }
-    // Drop the original tx, or we will always have a living sender
-    drop(tx);
+    // Drop our tx of result to prevent it from holding our wait-loop alive.
+    drop(out_tx);
 
-    // Consume all hashes from the channel into a HashMap
+    let files_to_check = filter_file_list(files);
+    for f in files_to_check {
+        in_tx.send(f).expect("All worker threads are gone");
+    }
+    // Drop our side of the channel to signal the workers that we are done
+    drop(in_tx);
+
     let mut groups: HashMap<String, Vec<PathBuf>> = HashMap::new();
-    while let Ok((sum, path)) = rx.recv() {
+    // Consume all hashes from the channel into a HashMap
+    while let Ok((sum, path)) = out_rx.recv() {
         groups.entry(sum).or_default().push(path);
     }
     for t in threads {
