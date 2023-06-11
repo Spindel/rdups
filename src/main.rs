@@ -97,7 +97,6 @@ fn group_files_by_checksum(
     files: BTreeMap<u64, Vec<Option<PathBuf>>>,
 ) -> Result<HashMap<String, Vec<PathBuf>>, io::Error> {
     let mut groups: HashMap<String, Vec<PathBuf>> = HashMap::new();
-    use rayon::prelude::*;
 
     let files_to_check = filter_file_list(files);
 
