@@ -4,14 +4,17 @@ use std::env;
 use std::fs::File;
 use std::io;
 use std::path::PathBuf;
-use std::vec::Vec;
 use std::time::Instant;
+use std::vec::Vec;
 
 // Walkdir
 use walkdir::WalkDir;
 
 // Blake3
 use blake3::Hasher;
+
+// Rayon
+use rayon::prelude::*;
 
 fn main() -> Result<(), io::Error> {
     // Parse arguments.
